@@ -14,7 +14,9 @@ class UsuarioCreate(BaseModel):
 
 class UsuarioUpdate(BaseModel):
     nombre: Optional[str] = None
+    email: Optional[str] = None
     pais: Optional[str] = None
+    password: Optional[str] = None
 
 class PeliculaCreate(BaseModel):
     titulo: str

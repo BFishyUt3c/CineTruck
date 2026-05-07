@@ -42,13 +42,6 @@ public class ThreadService {
         return threadRepository.save(thread);
     }
 
-    public ForumThread vote(String id, int delta) {
-        ForumThread thread = threadRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Thread not found"));
-        thread.setVotes(thread.getVotes() + delta);
-        return threadRepository.save(thread);
-    }
-
     public void delete(String id){
         if (!threadRepository.existsById(id)){
             throw new RuntimeException("Thread not found");

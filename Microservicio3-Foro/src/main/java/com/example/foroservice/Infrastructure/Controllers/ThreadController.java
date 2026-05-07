@@ -61,12 +61,6 @@ public class ThreadController {
         return ResponseEntity.status(HttpStatus.CREATED).body(threadService.create(thread));
     }
 
-    @PatchMapping("/{id}/vote")
-    public ResponseEntity<ForumThread> vote(@PathVariable String id, @RequestParam(defaultValue = "1") int delta) {
-        int safeDelta = delta < 0 ? -1 : 1;
-        return ResponseEntity.ok(threadService.vote(id, safeDelta));
-    }
-
     @DeleteMapping("/{id}")
     public ResponseEntity<ForumThread> delete(@PathVariable String id) {
         threadService.delete(id);

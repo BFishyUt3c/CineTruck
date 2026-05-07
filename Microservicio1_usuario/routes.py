@@ -60,8 +60,17 @@ def actualizar_usuario(id: int, datos: UsuarioUpdate, usuario_actual: Usuario = 
     # Actualizar campos
     if datos.nombre is not None:
         usuario.nombre = datos.nombre
+    if datos.email is not None:
+        email_limpio = datos.email.strip().lower()
+        if email_limpio != usuario.email:
+            existe = db.query(Usuario).filter(Usuario.email == email_limpio).first()
+            if existe:
+                raise HTTPException(status_code=400, detail="El correo ya está registrado")
+            usuario.email = email_limpio
     if datos.pais is not None:
         usuario.pais = datos.pais
+    if datos.password is not None and datos.password != "":
+        usuario.password = hash_password(datos.password)
     
     db.commit()
     db.refresh(usuario)

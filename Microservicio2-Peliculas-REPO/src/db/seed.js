@@ -75,6 +75,18 @@ async function getOrCreate(table, field, value, extra = {}) {
 
 export async function seedDatabase() {
 
+console.log('Verificando si ya existe data...')
+try {
+  const [rows] = await db.execute('SELECT COUNT(*) as total FROM movies')
+  const total = Array.isArray(rows) && rows[0] ? Number(rows[0].total) : 0
+  if (total > 0) {
+    console.log(`Seed omitido: ya existen ${total} peliculas en la BD.`)
+    return
+  }
+} catch (e) {
+  console.log('No se pudo verificar movies, se intentara seed igual.')
+}
+
 console.log('Insertando géneros...')
 const genreIds = {}
 for (const name of genres) {

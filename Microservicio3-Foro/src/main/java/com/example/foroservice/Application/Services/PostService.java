@@ -38,13 +38,6 @@ public class PostService {
         return postRepository.save(post);
     }
 
-    public Post vote(String id, int delta) {
-        Post post = postRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Post not found"));
-        post.setVotes(post.getVotes() + delta);
-        return postRepository.save(post);
-    }
-
     public void delete(String id){
         if (!postRepository.existsById(id)){
             throw new RuntimeException("Post not found");

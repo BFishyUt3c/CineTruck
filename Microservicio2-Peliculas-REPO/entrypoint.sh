@@ -21,7 +21,11 @@ echo "════════════════════════�
 echo "🌱 Ejecutando seed database..."
 echo "════════════════════════════════════════════════════════"
 
-node src/db/seed.js
+if [ "${SEED_ENABLED:-true}" = "true" ]; then
+  node src/db/seed.js
+else
+  echo "⏭️  Seed desactivado (SEED_ENABLED=false)"
+fi
 
 echo ""
 echo "════════════════════════════════════════════════════════"

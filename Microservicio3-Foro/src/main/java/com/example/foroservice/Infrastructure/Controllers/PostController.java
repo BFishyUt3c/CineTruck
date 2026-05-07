@@ -56,12 +56,6 @@ public class PostController {
         return ResponseEntity.status(HttpStatus.CREATED).body(postService.create(post));
     }
 
-    @PatchMapping("/{id}/vote")
-    public ResponseEntity<Post> vote(@PathVariable String id, @RequestParam(defaultValue = "1") int delta) {
-        int safeDelta = delta < 0 ? -1 : 1;
-        return ResponseEntity.ok(postService.vote(id, safeDelta));
-    }
-
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> delete(@PathVariable String id) {
         postService.delete(id);

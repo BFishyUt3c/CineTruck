@@ -5,6 +5,7 @@ from typing import Optional, Dict, List, Any
 import httpx
 import os
 import logging
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -235,6 +236,121 @@ async def obtener_todas_peliculas_ms2() -> List[Dict[str, Any]]:
         logger.warning(f"Error obteniendo películas: {str(e)}")
         return []
 
+async def obtener_detalles_peliculas_ms2(pelicula_ids: List[int], limit_concurrency: int = 20) -> List[Dict[str, Any]]:
+    """Obtiene detalles de muchas películas desde MS2 de forma concurrente."""
+    sem = asyncio.Semaphore(max(1, limit_concurrency))
+
+    async def fetch_one(pid: int) -> Optional[Dict[str, Any]]:
+        async with sem:
+            return await obtener_pelicula_ms2(pid)
+
+    tasks = [fetch_one(pid) for pid in pelicula_ids]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    detalles: List[Dict[str, Any]] = []
+    for r in results:
+        if isinstance(r, dict):
+            detalles.append(r)
+    return detalles
+
+async def obtener_todos_posts_ms3(size: int = 20000) -> List[Dict[str, Any]]:
+    """Obtiene posts del foro desde MS3 (paginado)"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{MS3_URL}/api/posts/all?page=0&size={size}",
+                timeout=TIMEOUT
+            )
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            if isinstance(data, dict):
+                return data.get("content", [])
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"Error obteniendo posts de MS3: {str(e)}")
+        return []
+
+async def obtener_todos_mensajes_ms3(size: int = 20000) -> List[Dict[str, Any]]:
+    """Obtiene mensajes del foro desde MS3 (paginado)"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{MS3_URL}/api/messages/all?page=0&size={size}",
+                timeout=TIMEOUT
+            )
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            if isinstance(data, dict):
+                return data.get("content", [])
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"Error obteniendo mensajes de MS3: {str(e)}")
+        return []
+
+def construir_ranking_mas_habladas(
+    peliculas: List[Dict[str, Any]],
+    threads: List[Dict[str, Any]],
+    posts: List[Dict[str, Any]],
+    mensajes: List[Dict[str, Any]],
+    top: int = 10
+) -> List[Dict[str, Any]]:
+    """Calcula ranking social por movieId usando data real de MS2 y MS3."""
+    movie_stats: Dict[str, Dict[str, int]] = {}
+    thread_to_movie: Dict[str, str] = {}
+
+    for thread in threads:
+        if not isinstance(thread, dict):
+            continue
+        thread_id = str(thread.get("id") or thread.get("_id") or "")
+        movie_id = str(thread.get("movieId") or "")
+        if not movie_id:
+            continue
+        if movie_id not in movie_stats:
+            movie_stats[movie_id] = {"threads": 0, "posts": 0, "mensajes": 0}
+        movie_stats[movie_id]["threads"] += 1
+        if thread_id:
+            thread_to_movie[thread_id] = movie_id
+
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        thread_id = str(post.get("threadId") or "")
+        movie_id = thread_to_movie.get(thread_id)
+        if movie_id:
+            movie_stats[movie_id]["posts"] += 1
+
+    for mensaje in mensajes:
+        if not isinstance(mensaje, dict):
+            continue
+        thread_id = str(mensaje.get("threadId") or "")
+        movie_id = thread_to_movie.get(thread_id)
+        if movie_id:
+            movie_stats[movie_id]["mensajes"] += 1
+
+    peliculas_por_id: Dict[str, Dict[str, Any]] = {}
+    for pelicula in peliculas:
+        if isinstance(pelicula, dict):
+            pelicula_id = pelicula.get("id")
+            if pelicula_id is not None:
+                peliculas_por_id[str(pelicula_id)] = pelicula
+
+    ranking: List[Dict[str, Any]] = []
+    for movie_id, stats in movie_stats.items():
+        score = stats["threads"] * 3 + stats["posts"] * 2 + stats["mensajes"]
+        pelicula = peliculas_por_id.get(movie_id, {})
+        ranking.append({
+            "movie_id": int(movie_id) if movie_id.isdigit() else movie_id,
+            "score": score,
+            "threads": stats["threads"],
+            "posts": stats["posts"],
+            "mensajes": stats["mensajes"],
+            "movie": pelicula
+        })
+
+    ranking.sort(key=lambda item: item["score"], reverse=True)
+    return ranking[:top]
+
 # Endpoints de la API
 
 @app.get("/", tags=["General"])
@@ -263,16 +379,103 @@ async def health_check() -> HealthCheck:
         timestamp=datetime.now().isoformat()
     )
 
-@app.get("/api/v1/movies", 
-         tags=["Películas"],
-         summary="Obtener todas las películas")
-async def obtener_peliculas():
-    """Obtiene todas las películas desde MS2 (a través del Orquestador MS4)"""
-    peliculas = await obtener_todas_peliculas_ms2()
+@app.get("/api/v1/movies/trending-talk", tags=["Análisis"])
+async def movies_trending_talk(top: int = 10):
+    """Ranking de películas más habladas usando actividad real de foro."""
+    peliculas, threads, posts, mensajes = await asyncio.gather(
+        obtener_todas_peliculas_ms2(),
+        obtener_threads_ms3(0),
+        obtener_todos_posts_ms3(),
+        obtener_todos_mensajes_ms3()
+    )
+    ranking = construir_ranking_mas_habladas(peliculas, threads or [], posts, mensajes, top=max(1, top))
     return {
-        "data": peliculas,
-        "total": len(peliculas)
+        "data": ranking,
+        "total": len(ranking)
     }
+
+@app.get("/api/v1/dashboard/home", tags=["Dashboard"])
+async def dashboard_home(request: Request, top: int = 10):
+    """Home unificado para frontend: usuario, hero, tendencias y actividad foro."""
+    peliculas, threads, posts, mensajes = await asyncio.gather(
+        obtener_todas_peliculas_ms2(),
+        obtener_threads_ms3(0),
+        obtener_todos_posts_ms3(),
+        obtener_todos_mensajes_ms3()
+    )
+
+    ranking = construir_ranking_mas_habladas(peliculas, threads or [], posts, mensajes, top=max(1, top))
+    hero_movie = ranking[0]["movie"] if ranking and ranking[0].get("movie") else (peliculas[0] if peliculas else None)
+
+    usuario = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Basic "):
+        import base64
+        try:
+            credenciales = base64.b64decode(auth_header[6:]).decode("utf-8")
+            email, password = credenciales.split(":", 1)
+            usuario = await me_ms1(email, password)
+        except Exception:
+            usuario = None
+
+    return {
+        "user": usuario,
+        "hero_movie": hero_movie,
+        "trending_talk": ranking,
+        "movies_total": len(peliculas),
+        "threads_total": len(threads) if isinstance(threads, list) else 0,
+        "posts_total": len(posts),
+        "messages_total": len(mensajes)
+    }
+
+@app.get("/api/v1/users/{usuario_id}/favorites", tags=["Usuarios"])
+async def user_favorites(usuario_id: int, request: Request, limit: int = 12):
+    """
+    Favoritas calculadas sin hardcode:
+    - Toma películas vistas del usuario (MS1)
+    - Trae detalle/rating de esas películas (MS2)
+    - Devuelve top por rating (desc)
+    """
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Se requiere autenticación")
+
+    # 1) historial real desde MS1
+    historial = await get_peliculas_vistas(usuario_id, request)  # puede ser list
+    if not isinstance(historial, list) or len(historial) == 0:
+        return {"usuario_id": usuario_id, "data": [], "total": 0}
+
+    ids: List[int] = []
+    for item in historial:
+        if isinstance(item, dict):
+            pid = item.get("pelicula_id") or item.get("peliculaId") or item.get("movie_id")
+        else:
+            pid = getattr(item, "pelicula_id", None)
+        try:
+            if pid is not None:
+                ids.append(int(pid))
+        except Exception:
+            continue
+
+    # únicos + límite por performance
+    ids_unique = list(dict.fromkeys(ids))[:200]
+    if not ids_unique:
+        return {"usuario_id": usuario_id, "data": [], "total": 0}
+
+    # 2) detalles desde MS2
+    detalles = await obtener_detalles_peliculas_ms2(ids_unique)
+
+    # 3) ordenar por rating (si existe)
+    def rating_of(p: Dict[str, Any]) -> float:
+        r = p.get("rating", 0)
+        try:
+            return float(r)
+        except Exception:
+            return 0.0
+
+    detalles.sort(key=rating_of, reverse=True)
+    top_items = detalles[: max(1, min(50, limit))]
+    return {"usuario_id": usuario_id, "data": top_items, "total": len(top_items)}
 
 @app.get("/api/v1/users/{usuario_id}", 
          response_model=PerfilCompleto,
@@ -624,7 +827,20 @@ async def obtener_peliculas_ms2(limit: int = 50, search: str = "") -> List[Dict[
             response = await client.get(url, timeout=TIMEOUT)
             if response.status_code == 200:
                 data = response.json()
-                return data if isinstance(data, list) else data.get("data", [])
+                peliculas = data if isinstance(data, list) else data.get("data", [])
+                # Fallback: si MS2 limita internamente /api/movies, intentar dataset completo.
+                if isinstance(peliculas, list) and limit > len(peliculas):
+                    try:
+                        all_resp = await client.get(f"{MS2_URL}/api/todos_los_registros", timeout=TIMEOUT)
+                        if all_resp.status_code == 200:
+                            all_data = all_resp.json()
+                            if isinstance(all_data, dict):
+                                todas = all_data.get("movies", [])
+                                if isinstance(todas, list) and len(todas) > len(peliculas):
+                                    return todas[:limit]
+                    except Exception as fallback_err:
+                        logger.warning(f"Fallback /api/todos_los_registros no disponible: {str(fallback_err)}")
+                return peliculas
             return []
     except Exception as e:
         logger.error(f"Error obteniendo películas: {str(e)}")
@@ -660,45 +876,6 @@ async def crear_resena_ms2(pelicula_id: int, datos: dict) -> Optional[Dict[str, 
     except Exception as e:
         logger.error(f"Error creando reseña: {str(e)}")
         return None
-
-async def obtener_posts_ms3(limit: int = 5000) -> List[Dict[str, Any]]:
-    """Obtiene posts paginados de MS3"""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{MS3_URL}/api/posts/all?page=0&size={limit}",
-                timeout=TIMEOUT
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict):
-                    return data.get("content", [])
-                return data if isinstance(data, list) else []
-            return []
-    except Exception as e:
-        logger.warning(f"No se pudo obtener posts de MS3: {str(e)}")
-        return []
-
-async def obtener_mensajes_ms3(limit: int = 5000) -> List[Dict[str, Any]]:
-    """Obtiene mensajes paginados de MS3"""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{MS3_URL}/api/messages/all?page=0&size={limit}",
-                timeout=TIMEOUT
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict):
-                    return data.get("content", [])
-                return data if isinstance(data, list) else []
-            return []
-    except Exception as e:
-        logger.warning(f"No se pudo obtener mensajes de MS3: {str(e)}")
-        return []
-
-def normalizar_titulo_pelicula(pelicula: Dict[str, Any]) -> str:
-    return pelicula.get("title") or pelicula.get("titulo") or f"Pelicula {pelicula.get('id', 'N/A')}"
 
 # ─── ENDPOINTS NUEVOS ─────────────────────────────────────────────────────────
 
@@ -1076,44 +1253,11 @@ async def delete_message(message_id: str):
         logger.error(f"Error eliminando mensaje: {str(e)}")
         raise HTTPException(status_code=502, detail="Error al conectar con MS3")
 
-@app.patch("/api/v1/threads/{thread_id}/vote", tags=["Foro"])
-async def vote_thread(thread_id: str, delta: int = 1):
-    """Vota un thread en MS3 (delta: 1 o -1)"""
-    safe_delta = -1 if delta < 0 else 1
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.patch(
-                f"{MS3_URL}/api/threads/{thread_id}/vote?delta={safe_delta}",
-                timeout=TIMEOUT
-            )
-            if response.status_code == 200:
-                return response.json()
-            raise HTTPException(status_code=response.status_code, detail="No se pudo votar thread")
-    except Exception as e:
-        logger.error(f"Error votando thread: {str(e)}")
-        raise HTTPException(status_code=502, detail="Error al conectar con MS3")
-
-@app.patch("/api/v1/posts/{post_id}/vote", tags=["Foro"])
-async def vote_post(post_id: str, delta: int = 1):
-    """Vota un post en MS3 (delta: 1 o -1)"""
-    safe_delta = -1 if delta < 0 else 1
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.patch(
-                f"{MS3_URL}/api/posts/{post_id}/vote?delta={safe_delta}",
-                timeout=TIMEOUT
-            )
-            if response.status_code == 200:
-                return response.json()
-            raise HTTPException(status_code=response.status_code, detail="No se pudo votar post")
-    except Exception as e:
-        logger.error(f"Error votando post: {str(e)}")
-        raise HTTPException(status_code=502, detail="Error al conectar con MS3")
-
 @app.get("/api/v1/movies", tags=["Películas"])
-async def get_peliculas(limit: int = 50, search: str = ""):
+async def get_peliculas(limit: int = 20000, search: str = ""):
     """Lista de películas de MS2"""
-    peliculas = await obtener_peliculas_ms2(limit, search)
+    limit_ajustado = max(1, min(limit, 20000))
+    peliculas = await obtener_peliculas_ms2(limit_ajustado, search)
     return {"data": peliculas, "total": len(peliculas)}
 
 @app.get("/api/v1/movies/{pelicula_id}", tags=["Películas"])
@@ -1131,136 +1275,6 @@ async def crear_resena(pelicula_id: int, datos: dict):
     if not res:
         raise HTTPException(status_code=400, detail="Error al crear reseña")
     return res
-
-@app.get("/api/v1/movies/social/trending-talk", tags=["Películas"])
-async def trending_talk(limit: int = 10):
-    """Ranking de películas más habladas usando datos reales de MS2 y MS3"""
-    peliculas = await obtener_todas_peliculas_ms2()
-    threads = await obtener_threads_ms3(0)
-    posts = await obtener_posts_ms3()
-    mensajes = await obtener_mensajes_ms3()
-
-    movies_by_id = {}
-    for p in peliculas:
-        movie_id = str(p.get("id"))
-        movies_by_id[movie_id] = p
-
-    stats = {}
-    for th in threads or []:
-        movie_id = str(th.get("movieId", ""))
-        thread_id = str(th.get("id") or th.get("_id") or "")
-        if not movie_id or movie_id not in movies_by_id:
-            continue
-        if movie_id not in stats:
-            stats[movie_id] = {"threads": 0, "posts": 0, "messages": 0, "votes": 0, "thread_ids": set()}
-        stats[movie_id]["threads"] += 1
-        stats[movie_id]["votes"] += int(th.get("votes", 0) or 0)
-        if thread_id:
-            stats[movie_id]["thread_ids"].add(thread_id)
-
-    thread_to_movie = {}
-    for movie_id, val in stats.items():
-        for tid in val["thread_ids"]:
-            thread_to_movie[tid] = movie_id
-
-    for post in posts or []:
-        tid = str(post.get("threadId", ""))
-        movie_id = thread_to_movie.get(tid)
-        if not movie_id:
-            continue
-        stats[movie_id]["posts"] += 1
-        stats[movie_id]["votes"] += int(post.get("votes", 0) or 0)
-
-    for msg in mensajes or []:
-        tid = str(msg.get("threadId", ""))
-        movie_id = thread_to_movie.get(tid)
-        if not movie_id:
-            continue
-        stats[movie_id]["messages"] += 1
-
-    ranking = []
-    for movie_id, val in stats.items():
-        score = (val["threads"] * 3) + (val["posts"] * 2) + val["messages"] + (val["votes"] * 0.5)
-        movie = movies_by_id[movie_id]
-        ranking.append({
-            "movie_id": int(movie_id) if movie_id.isdigit() else movie_id,
-            "title": normalizar_titulo_pelicula(movie),
-            "threads": val["threads"],
-            "posts": val["posts"],
-            "messages": val["messages"],
-            "votes": val["votes"],
-            "score": round(score, 2)
-        })
-
-    ranking.sort(key=lambda x: x["score"], reverse=True)
-    return {"data": ranking[:max(1, limit)], "total": len(ranking)}
-
-@app.get("/api/v1/movies/{pelicula_id}/insights", tags=["Películas"])
-async def movie_insights(pelicula_id: int):
-    """Métricas enriquecidas de una película cruzando MS1, MS2 y MS3"""
-    pelicula = await obtener_pelicula_ms2(pelicula_id)
-    if not pelicula:
-        raise HTTPException(status_code=404, detail="Película no encontrada")
-
-    threads = await obtener_threads_ms3(0)
-    posts = await obtener_posts_ms3()
-    mensajes = await obtener_mensajes_ms3()
-
-    movie_threads = [t for t in (threads or []) if str(t.get("movieId")) == str(pelicula_id)]
-    thread_ids = set(str(t.get("id") or t.get("_id")) for t in movie_threads if t.get("id") or t.get("_id"))
-    movie_posts = [p for p in (posts or []) if str(p.get("threadId")) in thread_ids]
-    movie_messages = [m for m in (mensajes or []) if str(m.get("threadId")) in thread_ids]
-
-    # Views reales de MS1: se basa en historial agregado (sin inventar)
-    total_vistas = 0
-    usuarios_muesticados = 200
-    for uid in range(1, usuarios_muesticados + 1):
-        h = await obtener_historial_ms1(uid)
-        if not h:
-            continue
-        vistas = h.get("peliculas_vistas", [])
-        for v in vistas:
-            if int(v.get("pelicula_id", -1)) == pelicula_id:
-                total_vistas += 1
-
-    votes_total = sum(int(t.get("votes", 0) or 0) for t in movie_threads) + sum(int(p.get("votes", 0) or 0) for p in movie_posts)
-    return {
-        "movie_id": pelicula_id,
-        "title": normalizar_titulo_pelicula(pelicula),
-        "threads": len(movie_threads),
-        "posts": len(movie_posts),
-        "messages": len(movie_messages),
-        "votes": votes_total,
-        "views_sampled": total_vistas
-    }
-
-@app.get("/api/v1/dashboard/home", tags=["Dashboard"])
-async def dashboard_home(request: Request, user_id: int = 1):
-    """Home agregada con data real de MS1/MS2/MS3"""
-    peliculas = await obtener_peliculas_ms2(limit=30)
-    talked = await trending_talk(limit=8)
-    historial = await obtener_historial_ms1(user_id)
-    threads = await obtener_threads_ms3(user_id)
-
-    auth_header = request.headers.get("authorization", "")
-    user_data = None
-    if auth_header.startswith("Basic "):
-        import base64
-        try:
-            credenciales = base64.b64decode(auth_header[6:]).decode("utf-8")
-            email, password = credenciales.split(":", 1)
-            user_data = await me_ms1(email, password)
-        except Exception:
-            user_data = None
-
-    return {
-        "user": user_data,
-        "hero_movie": peliculas[0] if peliculas else None,
-        "movies": peliculas,
-        "trending_talk": talked.get("data", []),
-        "history_total": len(historial.get("peliculas_vistas", [])) if historial else 0,
-        "forum_threads_total": len(threads) if isinstance(threads, list) else 0
-    }
 
 @app.post("/api/v1/users/{usuario_id}/vista/{pelicula_id}", tags=["Usuarios"])
 async def marcar_vista(usuario_id: int, pelicula_id: int):
