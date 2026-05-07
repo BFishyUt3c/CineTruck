@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.6.1/sockjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+</head>
+<body>
+    <h2>Test WebSocket - Foro</h2>
+    <input id="threadId" placeholder="pega el threadId aquí" style="width:350px"/>
+    <button onclick="conectar()">Conectar</button>
+    <br><br>
+    <input id="userId" placeholder="userId (ej: user_001)" style="width:350px"/>
+    <br><br>
+    <input id="mensaje" placeholder="escribe un mensaje" style="width:350px"/>
+    <button onclick="enviar()">Enviar</button>
+    <br><br>
+    <div id="estado" style="color:green;font-weight:bold"></div>
+    <br>
+    <div id="log" style="border:1px solid #ccc;padding:10px;height:250px;overflow-y:scroll;font-family:monospace"></div>
+
+    <script>
+        let stompClient = null;
+
+        function log(msg) {
+            const div = document.getElementById('log');
+            div.innerHTML += '<p style="margin:4px 0">' + new Date().toLocaleTimeString() + ' — ' + msg + '</p>';
+            div.scrollTop = div.scrollHeight;
+        }
+
+        function conectar() {
+            const threadId = document.getElementById('threadId').value.trim();
+            if (!threadId) { alert('Pon el threadId primero'); return; }
+
+            const socket = new SockJS('http://54.211.3.94:8080/ws'); // cambias por la ip publica de la mv
+            stompClient = Stomp.over(socket);
+            stompClient.debug = null;
+
+            stompClient.connect({}, function(frame) {
+                document.getElementById('estado').innerText = 'Conectado';
+                log('Conectado al servidor');
+
+                stompClient.subscribe('/topic/thread/' + threadId, function(msg) {
+                    const body = JSON.parse(msg.body);
+                    log('Mensaje recibido — userId: ' + body.userId + ' | texto: ' + body.text);
+                });
+
+                log('Suscrito a /topic/thread/' + threadId);
+            }, function(error) {
+                document.getElementById('estado').innerText = 'Error: ' + error;
+                log('Error de conexión: ' + error);
+            });
+        }
+
+        function enviar() {
+            if (!stompClient || !stompClient.connected) {
+                alert('Conéctate primero'); return;
+            }
+            const threadId = document.getElementById('threadId').value.trim();
+            const userId = document.getElementById('userId').value.trim() || 'user_001';
+            const texto = document.getElementById('mensaje').value.trim();
+            if (!texto) { alert('Escribe un mensaje'); return; }
+
+            stompClient.send(
+                '/app/chat/' + threadId,
+                {},
+                JSON.stringify({ userId: userId, text: texto })
+            );
+            log('Mensaje enviado: ' + texto);
+            document.getElementById('mensaje').value = '';
+        }
+    </script>
+</body>
+</html>
