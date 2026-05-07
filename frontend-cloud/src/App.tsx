@@ -27,7 +27,6 @@ import {
   getForosResumen,
 } from './api';
 
-// ─── TYPES ────────────────────────────────────────────────────────────────────
 type Tab = 'inicio' | 'peliculas' | 'foro' | 'perfil' | 'analytics';
 
 interface Movie {
