@@ -6,6 +6,7 @@ import {
   updateUser,
   getPeliculasVistas,
   marcarVista,
+  quitarVista,
   getMovie as apiGetMovie,
   getReviews,
   createReview as apiCreateReview,
@@ -176,11 +177,13 @@ const parsePosts = (payload: unknown): PostItem[] => {
 
 const parseReviews = (payload: unknown): ReviewItem[] => {
   if (Array.isArray(payload)) return payload as ReviewItem[];
-  const p = payload as { reviews?: unknown[]; data?: { reviews?: unknown[] } };
-  const d = p?.reviews ?? p?.data?.reviews;
-  return Array.isArray(d) ? (d as ReviewItem[]) : [];
+  const p = payload as { reviews?: unknown[]; data?: unknown[] | { reviews?: unknown[] } };
+  if (Array.isArray(p?.data)) return p.data as ReviewItem[];
+  const nested = (p?.data as { reviews?: unknown[] })?.reviews;
+  if (Array.isArray(nested)) return nested as ReviewItem[];
+  if (Array.isArray(p?.reviews)) return p.reviews as ReviewItem[];
+  return [];
 };
-
 const nameList = (arr?: Array<{ name?: string } | string>, limit = 6) => {
   if (!arr?.length) return 'N/D';
   return (
@@ -200,6 +203,27 @@ const fmt = (d?: string) =>
         year: 'numeric',
       })
     : '';
+
+const buildTopViewedMovies = (history: HistoryItem[], allMovies: Movie[]) => {
+  const counts = history.reduce<Record<number, { count: number; lastSeen: string }>>((acc, entry) => {
+    const pid = Number(entry.pelicula_id ?? entry.peliculaId ?? 0);
+    if (!pid) return acc;
+    if (!acc[pid]) acc[pid] = { count: 0, lastSeen: '' };
+    acc[pid].count += 1;
+    acc[pid].lastSeen = entry.fecha_vista || entry.fechaVista || entry.fecha || acc[pid].lastSeen;
+    return acc;
+  }, {});
+
+  return Object.entries(counts)
+    .map(([id, info]) => ({
+      pelicula_id: Number(id),
+      count: info.count,
+      lastSeen: info.lastSeen,
+      movie: allMovies.find((m) => m.id === Number(id)),
+    }))
+    .sort((a, b) => (b.count - a.count) || (Date.parse(b.lastSeen || '0') - Date.parse(a.lastSeen || '0')))
+    .slice(0, 5);
+};
 
 // ─── POSTER COMPONENT ─────────────────────────────────────────────────────────
 function Poster({ movie, className = '' }: { movie?: Movie | null; className?: string }) {
@@ -466,6 +490,7 @@ const CSS = `
 export default function App() {
   const [tab, setTab] = useState<Tab>('inicio');
   const [movies, setMovies] = useState<Movie[]>([]);
+  const [searchTerm, setSearchTerm] = useState('');
   const [threads, setThreads] = useState<Thread[]>([]);
   const [visibleCount, setVisibleCount] = useState(120);
   const [trending, setTrending] = useState<TrendingItem[]>([]);
@@ -562,22 +587,15 @@ export default function App() {
         getForosResumen(),
       ]);
 
-      // Axios wraps response in .data, backend also wraps in .data → double unwrap needed
-      // r.value         = axios response object
-      // r.value.data    = backend JSON: { data: [...] }
-      // r.value.data.data = the actual array
       const safeArr = (r: PromiseSettledResult<{ data: unknown }>): unknown[] => {
         if (r.status !== 'fulfilled') return [];
-        const axiosPayload = r.value.data; // backend JSON: { data: [...] } or [...]
-        // Handle double-wrapped: { data: [...] }
+        const axiosPayload = r.value.data; 
         const inner = (axiosPayload as { data?: unknown })?.data;
         if (Array.isArray(inner)) return inner;
-        // Handle single-wrapped: [...]
         if (Array.isArray(axiosPayload)) return axiosPayload;
         return [];
       };
 
-      // Resumen endpoints return { data: [{ key: val, ... }] } — array of one object
       const safeResumen = (r: PromiseSettledResult<{ data: unknown }>): ResumenItem => {
         const arr = safeArr(r);
         if (arr.length > 0 && typeof arr[0] === 'object' && arr[0] !== null) {
@@ -790,8 +808,8 @@ export default function App() {
 
   const saveProfile = async () => {
     if (!usuario || !token) return;
-    if (!perfil.nombre || !perfil.email || !perfil.pais) {
-      showMsg('error', 'Nombre, correo y país son obligatorios.'); return;
+    if (!perfil.nombre || !perfil.pais) {
+      showMsg('error', 'Nombre y país son obligatorios.'); return;
     }
     const payload: { nombre: string; pais: string; password?: string } = {
       nombre: perfil.nombre,
@@ -799,31 +817,54 @@ export default function App() {
     };
     if (perfil.password.trim()) payload.password = perfil.password.trim();
     try {
-      const r = await updateUser(usuario.id, payload, token);
-      const updated = r.data as Usuario;
-      setUsuario(updated);
-      const activePass = payload.password ?? password;
-      const newAuth = b64(updated.email, activePass);
-      setToken(newAuth); setEmail(updated.email);
-      if (payload.password) setPassword(payload.password);
-      localStorage.setItem('cine_email', updated.email);
-      localStorage.setItem('cine_password', activePass);
-      setPerfil({ nombre: updated.nombre, email: updated.email, pais: updated.pais, password: '' });
-      setShowEditModal(false); showMsg('info', 'Perfil actualizado.');
-    } catch {
+      await updateUser(usuario.id, payload, token);
+      
+      let currentToken = token;
+      
+      if (perfil.password.trim()) {
+        const newPass = perfil.password.trim();
+        setPassword(newPass);
+        localStorage.setItem('cine_password', newPass);
+        // Recalcular token con nuevo password
+        currentToken = b64(email, newPass);
+        setToken(currentToken);
+      }
+      
+      await refreshMe(currentToken);
+      
+      setShowEditModal(false);
+      setTab('perfil');
+      showMsg('info', 'Perfil actualizado.');
+    } catch (e) {
+      console.error('Error actualizando perfil:', e);
       showMsg('error', 'No se pudo actualizar perfil.');
     }
   };
 
-  const doMarkWatched = async (movieId: number) => {
-    if (!usuario) return;
+  const doToggleWatched = async (movieId?: number) => {
+    if (!usuario || movieId == null) {
+      showMsg('error', 'Inicia sesión para marcar o desmarcar vistas.');
+      return;
+    }
+    if (viewedIds.includes(movieId)) {
+      try {
+        await quitarVista(usuario.id, movieId);
+        setViewedIds((prev) => prev.filter((id) => id !== movieId));
+        setHistorial((prev) => prev.filter((item) => item.pelicula_id !== movieId));
+        if (token) await loadUserStats(usuario, token);
+        showMsg('info', 'Película desmarcada como vista.');
+      } catch {
+        showMsg('error', 'No se pudo desmarcar la película como vista.');
+      }
+      return;
+    }
     try {
       await marcarVista(usuario.id, movieId);
       setViewedIds((prev) => (prev.includes(movieId) ? prev : [...prev, movieId]));
       if (token) await loadUserStats(usuario, token);
       showMsg('info', '¡Marcada como vista!');
     } catch {
-      showMsg('error', 'No se pudo marcar (o ya estaba marcada).');
+      showMsg('error', 'No se pudo marcar como vista.');
     }
   };
 
@@ -843,7 +884,7 @@ export default function App() {
         const revRes = await getReviews(movie.id);
         setMovieReviews(parseReviews(revRes.data));
       } catch {
-        setMovieReviews(parseReviews(p));
+        setMovieReviews(parseReviews({ reviews: (p as Movie & { reviews?: ReviewItem[] }).reviews }));
       }
     } catch {
       try {
@@ -856,21 +897,41 @@ export default function App() {
   };
 
   const doCreateReview = async () => {
-    if (!selMovie || !usuario) return;
-    const comment = reviewDraft.comment.trim();
-    if (!comment) { showMsg('error', 'Escribe un comentario.'); return; }
+  if (!selMovie || !usuario) return;
+  const comment = reviewDraft.comment.trim();
+  if (!comment) { showMsg('error', 'Escribe un comentario.'); return; }
+  try {
+    await apiCreateReview(selMovie.id, {
+      author: usuario.nombre,
+      rating: Math.max(1, Math.min(10, Number(reviewDraft.rating))),
+      comment,
+    });
+
+    const newReview: ReviewItem = {
+      id: Date.now(),
+      author: usuario.nombre,
+      rating: Math.max(1, Math.min(10, Number(reviewDraft.rating))),
+      comment,
+      created_at: new Date().toISOString(),
+    };
+
+    setReviewDraft({ rating: 5, comment: '' });
+    showMsg('info', 'Reseña publicada.');
+
+    await new Promise(res => setTimeout(res, 1000));
     try {
-      const r = await apiCreateReview(selMovie.id, {
-        author: usuario.nombre,
-        rating: Math.max(1, Math.min(10, Number(reviewDraft.rating))),
-        comment,
-      });
-      setMovieReviews((prev) => [r.data as ReviewItem, ...prev]);
-      setReviewDraft({ rating: 5, comment: '' }); showMsg('info', 'Reseña publicada.');
+      const revRes = await getReviews(selMovie.id);
+      const serverReviews = parseReviews(revRes.data);
+            setMovieReviews(serverReviews.length > 0 ? serverReviews : [newReview]);
     } catch {
-      showMsg('error', 'No se pudo publicar la reseña.');
+      setMovieReviews(prev => [newReview, ...prev]);
     }
-  };
+
+  } catch (e) {
+    console.error('Error publicando reseña:', e);
+    showMsg('error', 'No se pudo publicar la reseña.');
+  }
+};
 
   const doCreateThread = async () => {
     if (!usuario) return;
@@ -1040,8 +1101,8 @@ export default function App() {
                         <div className="trending-card__actions">
                           {m && <button className="btn-sm-accent" onClick={() => void openMovieDetail(m)}>Detalle</button>}
                           {watched
-                            ? <button className="btn-sm-ghost" disabled>Vista ✓</button>
-                            : <button className="btn-sm-ghost" onClick={() => void doMarkWatched(mid)}>+ Vista</button>}
+                            ? <button className="btn-sm-ghost" onClick={(e) => { e.stopPropagation(); void doToggleWatched(mid); }}>Vista ✓</button>
+                            : <button className="btn-sm-ghost" onClick={(e) => { e.stopPropagation(); void doToggleWatched(mid); }}>+ Vista</button>}
                         </div>
                       </div>
                     </article>
@@ -1053,25 +1114,58 @@ export default function App() {
         )}
 
         {/* ── PELÍCULAS ── */}
-        {tab === 'peliculas' && (
-          <div className="section">
-            <div className="section-title">PELÍCULAS <span>Mostrando {Math.min(visibleCount, movies.length)} de {catalogTotal.toLocaleString()}</span></div>
-            <div className="movies-grid">
-              {movies.slice(0, visibleCount).map((m) => (
-                <article key={m.id} className="movie-card" onClick={() => void openMovieDetail(m)}>
-                  <div className="movie-card__poster"><Poster movie={m} /></div>
-                  <div className="movie-card__body">
-                    <h4>{m.title || m.titulo || 'Sin título'}</h4>
-                    <p>{m.year || m.año || 's/f'} · {m.duration || m.duracion || '?'} min</p>
+        {tab === 'peliculas' && (() => {
+          const filteredMovies = movies.filter((m) => {
+            const searchLower = searchTerm.toLowerCase();
+            const title = (m.title || m.titulo || '').toLowerCase();
+            const desc = (m.description || m.descripcion || m.synopsis || '').toLowerCase();
+            return title.includes(searchLower) || desc.includes(searchLower);
+          });
+          const displayMovies = filteredMovies.slice(0, visibleCount);
+          const totalDisplay = filteredMovies.length;
+
+          return (
+            <div className="section">
+              <div className="section-title">PELÍCULAS <span>Mostrando {Math.min(visibleCount, totalDisplay)} de {totalDisplay}</span></div>
+              <div style={{ marginBottom: '1.5rem' }}>
+                <input
+                  type="text"
+                  className="fld"
+                  placeholder="🔍 Buscar película por título..."
+                  value={searchTerm}
+                  onChange={(e) => {
+                    setSearchTerm(e.target.value);
+                    setVisibleCount(120);
+                  }}
+                  style={{ maxWidth: '400px' }}
+                />
+              </div>
+              {displayMovies.length === 0 && searchTerm ? (
+                <div className="empty-state">
+                  <div className="icon">🎬</div>
+                  <p>No se encontraron películas que coincidan con "{searchTerm}".<br />Intenta con otro término de búsqueda.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="movies-grid">
+                    {displayMovies.map((m) => (
+                      <article key={m.id} className="movie-card" onClick={() => void openMovieDetail(m)}>
+                        <div className="movie-card__poster"><Poster movie={m} /></div>
+                        <div className="movie-card__body">
+                          <h4>{m.title || m.titulo || 'Sin título'}</h4>
+                          <p>{m.year || m.año || 's/f'} · {m.duration || m.duracion || '?'} min</p>
+                        </div>
+                      </article>
+                    ))}
                   </div>
-                </article>
-              ))}
+                  {visibleCount < totalDisplay && (
+                    <div className="load-more"><button onClick={() => setVisibleCount((v) => v + 120)}>Cargar más películas</button></div>
+                  )}
+                </>
+              )}
             </div>
-            {visibleCount < movies.length && (
-              <div className="load-more"><button onClick={() => setVisibleCount((v) => v + 120)}>Cargar más películas</button></div>
-            )}
-          </div>
-        )}
+          );
+        })()}
 
         {/* ── FORO ── */}
         {tab === 'foro' && (
@@ -1114,7 +1208,6 @@ export default function App() {
                 <div className="role">{usuario.rol || 'usuario'}</div>
                 <div className="profile-stats-grid">
                   <div className="profile-stat"><div className="val">{historial.length}</div><div className="lbl">Vistas</div></div>
-                  <div className="profile-stat"><div className="val">0</div><div className="lbl">Favoritas</div></div>
                 </div>
                 <div className="profile-info">
                   <p><strong>ID:</strong> {usuario.id}</p>
@@ -1122,7 +1215,10 @@ export default function App() {
                   <p><strong>País:</strong> {usuario.pais}</p>
                   {usuario.fecha_registro && <p><strong>Registro:</strong> {fmt(usuario.fecha_registro)}</p>}
                 </div>
-                <button className="edit-btn" onClick={() => setShowEditModal(true)}>Editar perfil</button>
+                <button className="edit-btn" onClick={() => {
+                  setPerfil({ nombre: usuario.nombre, email: usuario.email, pais: usuario.pais, password: '' });
+                  setShowEditModal(true);
+                }}>Editar perfil</button>
               </div>
 
               <div>
@@ -1154,15 +1250,6 @@ export default function App() {
         {tab === 'analytics' && (() => {
           const ad = analyticsData;
 
-          // ── Helpers para leer campos exactos del backend (Athena devuelve strings) ──
-          // Géneros:    { genero, total_peliculas }
-          // Actores:    { actor, nacionalidad, total_peliculas }
-          // Directores: { director, total_peliculas }
-          // País:       { pais, total_usuarios }
-          // Foros:      { foro_id, total_mensajes }
-          // UsuariosTop:{ usuario_id, nombre, pais, peliculas_vistas }
-          // Resumen:    un objeto plano con claves variables
-
           const maxGen  = Math.max(1, ...(ad?.generos.map(g => Number(g.total_peliculas ?? 0)) ?? [1]));
           const maxAct  = Math.max(1, ...(ad?.actoresTop.map(a => Number(a.total_peliculas ?? 0)) ?? [1]));
           const maxDir  = Math.max(1, ...(ad?.directoresTop.map(d => Number(d.total_peliculas ?? 0)) ?? [1]));
@@ -1172,6 +1259,7 @@ export default function App() {
 
           const resU = ad?.resumenUsuarios ?? {};
           const resF = ad?.resumenForos ?? {};
+          const topViewed = buildTopViewedMovies(historial, movies);
 
           return (
             <div className="section">
@@ -1199,6 +1287,21 @@ export default function App() {
                         <div key={k} className="stat-item">
                           <div className="val">{typeof v === 'number' ? v.toLocaleString() : String(v ?? 0)}</div>
                           <div className="lbl">{k.replace(/_/g, ' ')}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {topViewed.length > 0 && (
+                    <div className="analytics-card" style={{ marginBottom: '1.5rem' }}>
+                      <h4>👁️ Películas más vistas</h4>
+                      {topViewed.map((item, i) => (
+                        <div key={item.pelicula_id} className="analytics-row">
+                          <div className="analytics-rank">{i + 1}</div>
+                          <div className="analytics-name" title={item.movie?.title || item.movie?.titulo || `Película ${item.pelicula_id}`}>
+                            {item.movie?.title || item.movie?.titulo || `Película ${item.pelicula_id}`}
+                          </div>
+                          <div className="analytics-count">{item.count} vistas</div>
                         </div>
                       ))}
                     </div>
@@ -1399,8 +1502,8 @@ export default function App() {
                 {selMovie.actors?.length ? <p className="meta-row"><strong>Reparto:</strong> {nameList(selMovie.actors as Array<{ name?: string } | string>)}</p> : null}
                 <div className="detail-actions">
                   {viewedIds.includes(selMovie.id)
-                    ? <button className="btn-sm-ghost" style={{ cursor: 'not-allowed', opacity: 0.5 }}>Vista ✓</button>
-                    : <button className="btn-sm-accent" onClick={() => void doMarkWatched(selMovie.id)}>+ Marcar vista</button>}
+                    ? <button className="btn-sm-ghost" onClick={(e) => { e.stopPropagation(); void doToggleWatched(selMovie.id); }}>Vista ✓</button>
+                    : <button className="btn-sm-accent" onClick={(e) => { e.stopPropagation(); void doToggleWatched(selMovie.id); }}>+ Marcar vista</button>}
                 </div>
               </div>
             </div>
